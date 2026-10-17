@@ -1,0 +1,6 @@
+/target
+/data
+*.session
+*.session-journal
+tmp/
+.env

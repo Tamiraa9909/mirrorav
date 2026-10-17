@@ -1,0 +1,20 @@
+[package]
+name = "mirrorav"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+futures-util = "0.3"
+wreq = "0.16"
+wreq-util = { version = "0.2", features = ["emulation"] }
+grammers-client = "0.11"
+grammers-session = "0.11"
+grammers-mtsender = "0.11"
+regex = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
+
+[profile.release]
+opt-level = 2
+strip = true
