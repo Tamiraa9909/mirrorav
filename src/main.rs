@@ -11,10 +11,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures_util::StreamExt;
-use grammers_client::message::{Attribute, InputMessage};
-use grammers_client::update::Update;
-use grammers_client::{Client, Message};
+use grammers_client::media::{Attribute, InputMedia};
+use grammers_client::update::{Message, Update};
+use grammers_client::Client;
 use grammers_mtsender::{SenderPool, UpdatesConfiguration};
 use grammers_session::storages::SqliteSession;
 use regex::Regex;
@@ -116,7 +115,8 @@ fn extract_playlists(page: &str) -> Vec<String> {
         if let Some(am) = args.captures(&bm[1]) {
             let payload = am[1].replace("\\'", "'");
             let base: u32 = am[2].parse().unwrap_or(10);
-            let keys: Vec<&str> = am[3].replace("\\'", "'").split('|').collect();
+            let keys_src = am[3].replace("\\'", "'");
+            let keys: Vec<&str> = keys_src.split('|').collect();
             let unpacked = unpack_packer(&payload, base, &keys);
             urls.extend(plain.find_iter(&unpacked).map(|m| m.as_str().to_string()));
         }
@@ -198,7 +198,8 @@ async fn download_segments(
 ) -> Res<u64> {
     use tokio::sync::Semaphore;
     let sem = Arc::new(Semaphore::new(par));
-    let mut handles = Vec::with_capacity(segs.len());
+    let mut handles: Vec<tokio::task::JoinHandle<Result<u64, BoxError>>> =
+        Vec::with_capacity(segs.len());
 
     for (i, url) in segs.into_iter().enumerate() {
         let http = http.clone();
@@ -510,7 +511,6 @@ struct App {
 async fn run_job(app: &App, status: Message, reply_ctx: &Message, url: String, want: String) {
     let shared: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
     let stop = Arc::new(AtomicBool::new(false));
-    let client = app.client.clone();
     let st = status.clone();
     let stop2 = stop.clone();
     let shared_task = shared.clone();
@@ -543,9 +543,9 @@ async fn run_job(app: &App, status: Message, reply_ctx: &Message, url: String, w
             let _ = status.edit("⬆️ uploading…").await;
             match app.client.upload_file(out.to_str().unwrap_or_default()).await {
                 Ok(uploaded) => {
-                    let im = InputMessage::new()
+                    let media = InputMedia::new()
                         .mime_type("video/mp4")
-                        .text(format!("{title}\n\nmirrorav 🕷 {want}"))
+                        .caption(format!("{title}\n\nmirrorav 🕷 {want}"))
                         .document(uploaded)
                         .attribute(Attribute::Video {
                             round_message: false,
@@ -554,15 +554,9 @@ async fn run_job(app: &App, status: Message, reply_ctx: &Message, url: String, w
                             w: 1280,
                             h: 720,
                         });
-                    match reply_ctx.peer_ref().await {
-                        Ok(Some(p)) => {
-                            let _ = client.send_message(p, im).await;
-                        }
-                        _ => {
-                            let _ = client
-                                .send_message(status.peer_ref().await.unwrap().unwrap(), im)
-                                .await;
-                        }
+                    match reply_ctx.respond_album(vec![media]).await {
+                        Ok(_) => info!("video terkirim"),
+                        Err(e) => error!("send failed: {e}"),
                     }
                 }
                 Err(e) => error!("upload failed: {e}"),
@@ -581,16 +575,12 @@ async fn shared_lock(s: &Arc<Mutex<String>>) -> String {
     s.lock().await.clone()
 }
 
-async fn handle(app: &App, update: Update) {
+async fn on_update(app: &App, update: Update) {
     let Update::NewMessage(message) = update else { return };
     if message.outgoing() {
         return;
     }
-    let is_admin = message
-        .chat()
-        .map(|p| p.id().to_string())
-        .as_deref()
-        == Some(app.cfg.admin_id.as_str());
+    let is_admin = message.peer_id().to_string() == app.cfg.admin_id;
     if !is_admin {
         return;
     }
@@ -666,10 +656,13 @@ async fn main() -> Res<()> {
 
     loop {
         let update = match stream.next().await {
-            Some(u) => u?,
-            None => break,
+            Ok(u) => u,
+            Err(e) => {
+                error!("update stream: {e}");
+                continue;
+            }
         };
-        handle(&app, update).await;
+        on_update(&app, update).await;
     }
     Ok(())
 }
