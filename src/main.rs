@@ -658,6 +658,7 @@ async fn on_callback(app: App, cq: CallbackQuery) {
     let Some((job, res)) = rest.split_once(':') else {
         return;
     };
+    let job = job.to_string();
     let pending = app.pending.lock().await.remove(job);
     let Some(p) = pending else {
         if let Ok(m) = cq.load_message().await {
