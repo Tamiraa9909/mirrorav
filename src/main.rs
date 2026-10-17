@@ -659,7 +659,7 @@ async fn on_callback(app: App, cq: CallbackQuery) {
         return;
     };
     let job = job.to_string();
-    let pending = app.pending.lock().await.remove(job);
+    let pending = app.pending.lock().await.remove(&job);
     let Some(p) = pending else {
         if let Ok(m) = cq.load_message().await {
             let _ = m.respond("🕷️ menu expired — kirim /mirror lagi").await;
@@ -725,7 +725,7 @@ async fn on_callback(app: App, cq: CallbackQuery) {
             app2.http.clone(),
             &app2.cfg.work_dir,
             app2.cfg.parallel,
-            job,
+            &job,
             &variant,
             shared.clone(),
         )
