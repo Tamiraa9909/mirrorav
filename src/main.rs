@@ -1,18 +1,21 @@
 //! MediaFairy mirrorav — HLS mirror runner (Telegram bot, MTProto).
 //!
-//! /mirror <url> [360p|480p|720p]
-//!   -> fetch page (Safari TLS impersonation, reader fallback)
-//!   -> unpack Dean-Edwards packer -> master.m3u8 -> variant -> segments
-//!   -> parallel download -> ffmpeg concat -> MTProto upload (<=2GB)
+//! /mirror <url>
+//!   -> resolve (page -> packer -> m3u8 -> variants + duration + thumbnail)
+//!   -> photo card (title / size est / duration / category) + inline buttons
+//!   -> button callback -> parallel download -> ffmpeg concat -> MTProto upload
+//!
+//! Admin-only, long-lived via MTProto stream (no webhook, no HTTP bot API).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use grammers_client::media::{Attribute, InputMedia};
-use grammers_client::update::{Message, Update};
+use grammers_client::message::{Button, InputMessage, ReplyMarkup};
+use grammers_client::update::{CallbackQuery, Message, Update};
 use grammers_client::Client;
 use grammers_mtsender::{SenderPool, UpdatesConfiguration};
 use grammers_session::storages::SqliteSession;
@@ -42,8 +45,7 @@ struct Cfg {
 fn cfg() -> Res<Cfg> {
     Ok(Cfg {
         bot_token: std::env::var("BOT_TOKEN")?,
-        admin_id: std::env::var("ADMIN_ID")
-            .unwrap_or_default(),
+        admin_id: std::env::var("ADMIN_ID").unwrap_or_default(),
         api_id: std::env::var("API_ID")?.parse()?,
         api_hash: std::env::var("API_HASH")?,
         parallel: std::env::var("PARALLEL")
@@ -133,34 +135,36 @@ fn extract_playlists(page: &str) -> Vec<String> {
     ordered
 }
 
-fn pick_quality(master: &str, want: &str, base: &str) -> Res<String> {
-    let res_re = Regex::new(r"RESOLUTION=(\d+)x\d+").unwrap();
-    let want_w: u32 = match want {
-        "360p" => 640,
-        "480p" => 854,
-        _ => 1280,
-    };
-    let mut best: Option<(u32, String)> = None;
-    let mut cur_w = 0u32;
+/// master playlist -> (height, bandwidth, url)
+fn parse_master_variants(master: &str, base: &str) -> Vec<(u32, u64, String)> {
+    let res_re = Regex::new(r"RESOLUTION=\d+x(\d+)").unwrap();
+    let bw_re = Regex::new(r"BANDWIDTH=(\d+)").unwrap();
+    let mut out = Vec::new();
+    let mut cur: Option<(u32, u64)> = None;
     for line in master.lines() {
-        if let Some(m) = res_re.captures(line) {
-            cur_w = m[1].parse().unwrap_or(0);
-        } else if !line.is_empty() && !line.starts_with('#') && cur_w > 0 {
-            let better = match &best {
-                None => true,
-                Some((bw, _)) => cur_w.abs_diff(want_w) < bw.abs_diff(want_w),
-            };
-            if better {
-                best = Some((cur_w, line.to_string()));
+        let line = line.trim();
+        if let Some(at) = line.strip_prefix("#EXT-X-STREAM-INF") {
+            let h = res_re
+                .captures(at)
+                .and_then(|c| c[1].parse().ok())
+                .unwrap_or(0);
+            let bw = bw_re
+                .captures(at)
+                .and_then(|c| c[1].parse().ok())
+                .unwrap_or(0);
+            cur = Some((h, bw));
+        } else if !line.is_empty() && !line.starts_with('#') {
+            if let Some((h, bw)) = cur.take() {
+                let url = if line.starts_with("http") {
+                    line.to_string()
+                } else {
+                    format!("{}/{}", base.trim_end_matches('/'), line)
+                };
+                out.push((h, bw, url));
             }
         }
     }
-    let best = best.ok_or("no variant playlists found")?.1;
-    Ok(if best.starts_with("http") {
-        best
-    } else {
-        format!("{}/{}", base.trim_end_matches('/'), best)
-    })
+    out
 }
 
 fn parse_segments(text: &str, base: &str) -> Res<(Vec<String>, Vec<f64>)> {
@@ -186,6 +190,49 @@ fn parse_segments(text: &str, base: &str) -> Res<(Vec<String>, Vec<f64>)> {
         }
     }
     Ok((segs, durs))
+}
+
+fn page_title(page: &str) -> String {
+    let re = Regex::new(r"<title>([^<]+)").unwrap();
+    if let Some(m) = re.captures(page) {
+        let t = m[1].trim().trim_end_matches(|c| c == '-' || c == ' ').trim();
+        if !t.is_empty() {
+            return t.to_string();
+        }
+    }
+    let re = Regex::new(r"(?m)^Title: (.+)$").unwrap();
+    re.captures(page)
+        .map(|m| m[1].to_string())
+        .unwrap_or_else(|| "mirror".into())
+}
+
+fn page_category(page: &str) -> String {
+    let re = Regex::new(r#"/tags/([\w-]+)"#).unwrap();
+    let mut seen = std::collections::HashSet::new();
+    let mut tags = Vec::new();
+    for m in re.captures_iter(page) {
+        let t = m[1].to_string();
+        if seen.insert(t.clone()) {
+            tags.push(t);
+        }
+        if tags.len() >= 3 {
+            break;
+        }
+    }
+    if tags.is_empty() {
+        "-".into()
+    } else {
+        tags.join(", ")
+    }
+}
+
+fn og_image(page: &str) -> Option<String> {
+    let re = Regex::new(r#"og:image" content="([^"]+)""#).unwrap();
+    if let Some(m) = re.captures(page) {
+        return Some(m[1].to_string());
+    }
+    let re2 = Regex::new(r#"content="([^"]+)"[^>]*og:image"#).unwrap();
+    re2.captures(page).map(|m| m[1].to_string())
 }
 
 // ---------------------------------------------------------------- download
@@ -262,20 +309,6 @@ fn sanitize_name(title: &str) -> String {
     format!("{t}.mp4")
 }
 
-fn page_title(page: &str) -> String {
-    let re = Regex::new(r"<title>([^<]+)").unwrap();
-    if let Some(m) = re.captures(page) {
-        let t = m[1].trim().trim_end_matches(|c| c == '-' || c == ' ').trim();
-        if !t.is_empty() {
-            return t.to_string();
-        }
-    }
-    let re = Regex::new(r"(?m)^Title: (.+)$").unwrap();
-    re.captures(page)
-        .map(|m| m[1].to_string())
-        .unwrap_or_else(|| "mirror".into())
-}
-
 async fn ffmpeg_concat(dir: &Path, out: &Path) -> Res<()> {
     let mut files: Vec<PathBuf> = std::fs::read_dir(dir)?
         .filter_map(|e| e.ok().map(|e| e.path()))
@@ -339,81 +372,60 @@ async fn raw_concat(files: &[PathBuf], out: &Path) -> Res<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------- job
+// ---------------------------------------------------------------- state
+#[derive(Clone)]
+struct Variant {
+    h: u32,
+    bw: u64,
+    url: String,
+}
+
+#[derive(Clone)]
+struct Pending {
+    title: String,
+    dur_secs: f64,
+    variants: Vec<Variant>,
+}
+
+#[derive(Clone)]
+struct App {
+    client: Client,
+    cfg: Cfg,
+    http: HttpClient,
+    busy: Arc<Mutex<()>>,
+    pending: Arc<Mutex<HashMap<String, Pending>>>,
+    job_counter: Arc<AtomicU32>,
+}
+
 async fn set_prog(shared: &Arc<Mutex<String>>, text: &str) {
     *shared.lock().await = text.to_string();
 }
 
-async fn do_job(
+async fn shared_lock(s: &Arc<Mutex<String>>) -> String {
+    s.lock().await.clone()
+}
+
+async fn download_and_prepare(
     http: HttpClient,
     work_dir: &str,
     parallel: usize,
-    url: &str,
-    want: &str,
+    job: &str,
+    variant: &Variant,
     shared: Arc<Mutex<String>>,
-) -> Res<(PathBuf, PathBuf, String, u64)> {
-    set_prog(&shared, "🕷️ fetching page…").await;
-    let page = get_page(&http, url).await?;
-    let title = page_title(&page);
-    let pls = extract_playlists(&page);
-    if pls.is_empty() {
-        return Err("no m3u8 found on page".into());
+) -> Res<(PathBuf, PathBuf, u64)> {
+    set_prog(&shared, "🎬 membaca playlist…").await;
+    let vt = http
+        .get(&variant.url)
+        .header("referer", REFERER)
+        .send()
+        .await?
+        .text()
+        .await?;
+    if vt.contains("METHOD=AES") {
+        return Err("playlist is AES-encrypted — not supported".into());
     }
-    let master_url = pls
-        .iter()
-        .find(|u| u.contains("playlist.m3u8"))
-        .unwrap_or_else(|| pls.first().unwrap())
-        .clone();
-    set_prog(&shared, &format!("📬 master: {master_url}")).await;
-
-    let (media_text, var_base) = if master_url.contains("playlist.m3u8") {
-        let master = http
-            .get(&master_url)
-            .header("referer", REFERER)
-            .send()
-            .await?
-            .text()
-            .await?;
-        if master.contains("METHOD=AES") {
-            return Err("playlist is AES-encrypted — not supported".into());
-        }
-        let base_dir = master_url
-            .rsplit_once('/')
-            .map(|x| x.0)
-            .unwrap_or_default()
-            .to_string();
-        let variant = pick_quality(&master, want, &base_dir)?;
-        set_prog(&shared, &format!("🔗 variant: {variant}")).await;
-        let vt = http
-            .get(&variant)
-            .header("referer", REFERER)
-            .send()
-            .await?
-            .text()
-            .await?;
-        let vbase = variant
-            .rsplit_once('/')
-            .map(|x| x.0)
-            .unwrap_or_default()
-            .to_string();
-        (vt, vbase)
-    } else {
-        let vt = http
-            .get(&master_url)
-            .header("referer", REFERER)
-            .send()
-            .await?
-            .text()
-            .await?;
-        let vbase = master_url
-            .rsplit_once('/')
-            .map(|x| x.0)
-            .unwrap_or_default()
-            .to_string();
-        (vt, vbase)
-    };
-
-    let (segs, durs) = parse_segments(&media_text, &var_base)?;
+    let vbase = variant.url.rsplit_once('/').map(|x| x.0).unwrap_or_default();
+    let (segs, durs) = parse_segments(&vt, &vbase)?;
     if segs.is_empty() {
         return Err("no segments in playlist".into());
     }
@@ -425,7 +437,7 @@ async fn do_job(
     )
     .await;
 
-    let tmp_dir = PathBuf::from(work_dir).join(format!("mf_{}", std::process::id()));
+    let tmp_dir = PathBuf::from(work_dir).join(format!("mf_{job}"));
     if tmp_dir.exists() {
         std::fs::remove_dir_all(&tmp_dir)?;
     }
@@ -445,7 +457,11 @@ async fn do_job(
             }
             let d = done2.load(Ordering::Relaxed);
             if d > 0 && (d % 12 == 0 || d == dl_total) {
-                set_prog(&shared2, &format!("⬇️ downloading {d}/{dl_total} ({}%)", d * 100 / dl_total)).await;
+                set_prog(
+                    &shared2,
+                    &format!("⬇️ downloading {d}/{dl_total} ({}%)", d * 100 / dl_total),
+                )
+                .await;
             }
             if d == dl_total {
                 break;
@@ -466,9 +482,294 @@ async fn do_job(
     )
     .await;
 
-    let out = tmp_dir.join(sanitize_name(&title));
+    let out = tmp_dir.join(sanitize_name("mirrorav"));
     ffmpeg_concat(&tmp_dir, &out).await?;
-    Ok((out, tmp_dir, title, dur_secs))
+    Ok((out, tmp_dir, dur_secs))
+}
+
+// ---------------------------------------------------------------- resolve -> menu
+async fn resolve_and_menu(app: App, msg: Message, url: String) {
+    let status = match msg.respond("🕷️ meresolve…").await {
+        Ok(s) => s,
+        Err(e) => {
+            error!("respond: {e}");
+            return;
+        }
+    };
+
+    let result: Res<()> = async {
+        let job = format!(
+            "{:06x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos() as u64)
+                .unwrap_or(0)
+                ^ (app.job_counter.fetch_add(1, Ordering::Relaxed) as u64).wrapping_mul(7919)
+        );
+
+        let page = get_page(&app.http, &url).await?;
+        let title = page_title(&page);
+        let category = page_category(&page);
+
+        let _ = status.edit("🔗 mencari playlist…").await;
+        let pls = extract_playlists(&page);
+        if pls.is_empty() {
+            return Err("no m3u8 found on page".into());
+        }
+        let master_url = pls
+            .iter()
+            .find(|u| u.contains("playlist.m3u8"))
+            .unwrap_or_else(|| pls.first().unwrap())
+            .clone();
+
+        let _ = status.edit("🎚 membaca varian…").await;
+        let master = app
+            .http
+            .get(&master_url)
+            .header("referer", REFERER)
+            .send()
+            .await?
+            .text()
+            .await?;
+        if master.contains("METHOD=AES") {
+            return Err("playlist is AES-encrypted — not supported".into());
+        }
+        let base = master_url.rsplit_once('/').map(|x| x.0).unwrap_or_default();
+        let mut variants: Vec<Variant> = parse_master_variants(&master, base)
+            .into_iter()
+            .map(|(h, bw, url)| Variant { h, bw, url })
+            .collect();
+        variants.sort_by_key(|v| v.h);
+
+        let dur_secs: f64;
+        if variants.is_empty() {
+            // langsung media playlist (tanpa varian)
+            let (_, durs) = parse_segments(&master, base)?;
+            dur_secs = durs.iter().sum();
+            variants.push(Variant {
+                h: 720,
+                bw: 0,
+                url: master_url.clone(),
+            });
+        } else {
+            let best = variants.last().unwrap();
+            let vt = app
+                .http
+                .get(&best.url)
+                .header("referer", REFERER)
+                .send()
+                .await?
+                .text()
+                .await?;
+            let vbase = best.url.rsplit_once('/').map(|x| x.0).unwrap_or_default();
+            let (_, durs) = parse_segments(&vt, &vbase)?;
+            dur_secs = durs.iter().sum();
+        }
+        if dur_secs <= 0.0 {
+            return Err("empty playlist".into());
+        }
+
+        // thumbnail
+        let mut thumb_tmp: Option<PathBuf> = None;
+        if let Some(turl) = og_image(&page) {
+            if let Ok(r) = app.http.get(&turl).header("referer", REFERER).send().await {
+                if r.status() == 200 {
+                    if let Ok(b) = r.bytes().await {
+                        if b.len() > 1024 {
+                            let p = PathBuf::from(&app.cfg.work_dir).join(format!("thumb_{job}.bin"));
+                            if tokio::fs::write(&p, &b).await.is_ok() {
+                                thumb_tmp = Some(p);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // simpan pending untuk callback
+        app.pending.lock().await.insert(
+            job.clone(),
+            Pending {
+                title: title.clone(),
+                dur_secs,
+                variants: variants.clone(),
+            },
+        );
+
+        // caption + tombol
+        let mins = (dur_secs / 60.0) as u64;
+        let secs = (dur_secs % 60.0) as u64;
+        let caption = format!(
+            "📛 {title}\n⏱ {mins}:{secs:02}\n🏷 {category}\n\npilih kualitas 👇"
+        );
+        let buttons: Vec<Button> = variants
+            .iter()
+            .map(|v| {
+                let est_mb = ((dur_secs * v.bw as f64) / 8.0 / 1e6).round() as u64;
+                let label = if v.bw > 0 {
+                    format!("{}p ~{}MB", v.h, est_mb)
+                } else {
+                    format!("{}p", v.h)
+                };
+                Button::data(label, format!("q:{job}:{}", v.h).into_bytes())
+            })
+            .collect();
+        let markup = ReplyMarkup::from_buttons_row(&buttons);
+
+        let im = InputMessage::new().text(caption.clone()).reply_markup(markup);
+        let sent = if let Some(tp) = &thumb_tmp {
+            match app.client.upload_file(tp.to_str().unwrap_or_default()).await {
+                Ok(up) => msg.respond(im.photo(up)).await,
+                Err(_) => msg.respond(im).await,
+            }
+        } else {
+            msg.respond(im).await
+        };
+
+        if let Some(tp) = &thumb_tmp {
+            let _ = tokio::fs::remove_file(tp).await;
+        }
+
+        match sent {
+            Ok(_) => {
+                let _ = status.delete().await;
+                Ok(())
+            }
+            Err(e) => Err(format!("gagal kirim menu: {e}").into()),
+        }
+    }
+    .await;
+
+    if let Err(e) = result {
+        error!("resolve failed: {e}");
+        let _ = status.edit(format!("❌ {e}")).await;
+    }
+}
+
+// ---------------------------------------------------------------- callback
+async fn on_callback(app: App, cq: CallbackQuery) {
+    if cq.sender_id().to_string() != app.cfg.admin_id {
+        return;
+    }
+    let data = String::from_utf8_lossy(cq.data()).to_string();
+    let Some(rest) = data.strip_prefix("q:") else {
+        return;
+    };
+    let Some((job, res)) = rest.split_once(':') else {
+        return;
+    };
+    let pending = app.pending.lock().await.remove(job);
+    let Some(p) = pending else {
+        if let Ok(m) = cq.load_message().await {
+            let _ = m.respond("🕷️ menu expired — kirim /mirror lagi").await;
+        }
+        return;
+    };
+
+    let h: u32 = res.parse().unwrap_or(0);
+    let Some(variant) = p.variants.iter().min_by_key(|v| (v.h as i64 - h as i64).abs()).cloned() else {
+        return;
+    };
+
+    let app2 = app.clone();
+    if app.busy.try_lock().is_err() {
+        if let Ok(m) = cq.load_message().await {
+            let _ = m.respond("🕷️ ada job berjalan — tunggu selesai").await;
+        }
+        return;
+    }
+
+    tokio::spawn(async move {
+        let _guard = app2.busy.lock().await;
+        let loaded = match cq.load_message().await {
+            Ok(m) => m,
+            Err(e) => {
+                error!("load_message: {e}");
+                return;
+            }
+        };
+        let status = match loaded
+            .respond(format!("⬇️ mengunduh {}p — samakan posisi…", variant.h))
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                error!("respond: {e}");
+                return;
+            }
+        };
+
+        // reporter loop
+        let shared: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let st = status.clone();
+        let stop2 = stop.clone();
+        let shared_task = shared.clone();
+        tokio::spawn(async move {
+            let mut last = String::new();
+            loop {
+                tokio::time::sleep(Duration::from_secs(12)).await;
+                if stop2.load(Ordering::Relaxed) {
+                    break;
+                }
+                let t = shared_lock(&shared_task).await;
+                if !t.is_empty() && t != last {
+                    let _ = st.edit(format!("{t}\n——— mirrorav 🕷")).await;
+                    last = t;
+                }
+            }
+        });
+
+        match download_and_prepare(
+            app2.http.clone(),
+            &app2.cfg.work_dir,
+            app2.cfg.parallel,
+            job,
+            &variant,
+            shared.clone(),
+        )
+        .await
+        {
+            Ok((out, tmp_dir, dur_secs)) => {
+                let _ = status.edit("⬆️ uploading…").await;
+                match app2
+                    .client
+                    .upload_file(out.to_str().unwrap_or_default())
+                    .await
+                {
+                    Ok(uploaded) => {
+                        let media = InputMedia::new()
+                            .mime_type("video/mp4")
+                            .caption(format!("{}\n\nmirrorav 🕷 {}p", p.title, variant.h))
+                            .document(uploaded)
+                            .attribute(Attribute::Video {
+                                round_message: false,
+                                supports_streaming: true,
+                                duration: Duration::from_secs(dur_secs),
+                                w: 1280,
+                                h: variant.h as i32,
+                            });
+                        if let Err(e) = loaded.respond_album(vec![media]).await {
+                            error!("send: {e}");
+                            let _ = status.edit(format!("❌ kirim gagal: {e}")).await;
+                        } else {
+                            let _ = status.delete().await;
+                        }
+                    }
+                    Err(e) => {
+                        error!("upload: {e}");
+                        let _ = status.edit(format!("❌ upload gagal: {e}")).await;
+                    }
+                }
+                let _ = std::fs::remove_dir_all(&tmp_dir);
+            }
+            Err(e) => {
+                error!("job failed: {e}");
+                let _ = status.edit(format!("❌ failed: {e}")).await;
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+    });
 }
 
 // ---------------------------------------------------------------- telegram
@@ -500,127 +801,46 @@ async fn health_server(port: u16) {
     }
 }
 
-#[derive(Clone)]
-struct App {
-    client: Client,
-    cfg: Cfg,
-    http: HttpClient,
-    busy: Arc<Mutex<()>>,
-}
-
-async fn run_job(app: &App, status: grammers_client::message::Message, reply_ctx: &Message, url: String, want: String) {
-    let shared: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
-    let stop = Arc::new(AtomicBool::new(false));
-    let st = status.clone();
-    let stop2 = stop.clone();
-    let shared_task = shared.clone();
-    tokio::spawn(async move {
-        let mut last = String::new();
-        loop {
-            tokio::time::sleep(Duration::from_secs(12)).await;
-            if stop2.load(Ordering::Relaxed) {
-                break;
-            }
-            let t = shared_lock(&shared_task).await;
-            if !t.is_empty() && t != last {
-                let _ = st.edit(format!("{t}\n——— mirrorav 🕷")).await;
-                last = t;
-            }
-        }
-    });
-
-    match do_job(
-        app.http.clone(),
-        &app.cfg.work_dir,
-        app.cfg.parallel,
-        &url,
-        &want,
-        shared.clone(),
-    )
-    .await
-    {
-        Ok((out, tmp_dir, title, dur_secs)) => {
-            let _ = status.edit("⬆️ uploading…").await;
-            match app.client.upload_file(out.to_str().unwrap_or_default()).await {
-                Ok(uploaded) => {
-                    let media = InputMedia::new()
-                        .mime_type("video/mp4")
-                        .caption(format!("{title}\n\nmirrorav 🕷 {want}"))
-                        .document(uploaded)
-                        .attribute(Attribute::Video {
-                            round_message: false,
-                            supports_streaming: true,
-                            duration: Duration::from_secs(dur_secs),
-                            w: 1280,
-                            h: 720,
-                        });
-                    match reply_ctx.respond_album(vec![media]).await {
-                        Ok(_) => info!("video terkirim"),
-                        Err(e) => error!("send failed: {e}"),
-                    }
-                }
-                Err(e) => error!("upload failed: {e}"),
-            }
-            let _ = std::fs::remove_dir_all(&tmp_dir);
-        }
-        Err(e) => {
-            error!("job failed: {e}");
-            let _ = status.edit(format!("❌ failed: {e}")).await;
-        }
-    }
-    stop.store(true, Ordering::Relaxed);
-}
-
-async fn shared_lock(s: &Arc<Mutex<String>>) -> String {
-    s.lock().await.clone()
-}
-
 async fn on_update(app: &App, update: Update) {
-    let Update::NewMessage(message) = update else { return };
-    if message.outgoing() {
-        return;
-    }
-    let is_admin = message.peer_id().to_string() == app.cfg.admin_id;
-    if !is_admin {
-        return;
-    }
-    let text = message.text().to_string();
-
-    if text.starts_with("/start") || text.starts_with("/help") {
-        let _ = message
-            .reply(
-                "MediaFairy mirrorav 🕷\n\n/mirror <url> [360p|480p|720p]\ndefault 720p • admin-only",
-            )
-            .await;
-        return;
-    }
-
-    if let Some(rest) = text.strip_prefix("/mirror") {
-        let args = rest.trim();
-        let (url, want) = match args.split_whitespace().collect::<Vec<_>>().as_slice() {
-            [u] => (u.to_string(), "720p".to_string()),
-            [u, q] => (u.to_string(), q.to_string()),
-            _ => {
-                let _ = message.reply("pakai: /mirror <url> [360p|480p|720p]").await;
+    match update {
+        Update::NewMessage(message) => {
+            if message.outgoing() {
                 return;
             }
-        };
-        if app.busy.try_lock().is_err() {
-            let _ = message.reply("🕷️ ada job berjalan — tunggu selesai").await;
-            return;
-        }
-
-        let app2 = app.clone();
-        tokio::spawn(async move {
-            let _guard = app2.busy.lock().await;
-            match message.reply(format!("🕷️ job diterima\n🔗 {url}\n🎚 kualitas: {want}")).await {
-                Ok(status) => {
-                    run_job(&app2, status.clone(), &message, url, want).await;
-                }
-                Err(e) => error!("reply failed: {e}"),
+            if message.peer_id().to_string() != app.cfg.admin_id {
+                return;
             }
-            // safety net un-guarded by stop at end of run_job
-        });
+            let text = message.text().to_string();
+
+            if text.starts_with("/start") || text.starts_with("/help") {
+                let _ = message
+                    .reply(
+                        "MediaFairy mirrorav 🕷\n\n/mirror <url>\n→ pilih kualitas via tombol",
+                    )
+                    .await;
+                return;
+            }
+
+            if let Some(rest) = text.strip_prefix("/mirror") {
+                let Some(url) = rest.trim().split_whitespace().next() else {
+                    let _ = message.reply("pakai: /mirror <url>").await;
+                    return;
+                };
+                let app2 = app.clone();
+                let msg = message.clone();
+                let url = url.to_string();
+                tokio::spawn(async move {
+                    resolve_and_menu(app2, msg, url).await;
+                });
+            }
+        }
+        Update::CallbackQuery(cq) => {
+            let app2 = app.clone();
+            tokio::spawn(async move {
+                on_callback(app2, cq).await;
+            });
+        }
+        _ => {}
     }
 }
 
@@ -633,12 +853,16 @@ async fn main() -> Res<()> {
     let cfg = cfg()?;
     std::fs::create_dir_all(&cfg.work_dir)?;
 
-    let port: u16 = std::env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(7860);
+    let port: u16 = std::env::var("PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(7860);
     tokio::spawn(health_server(port));
 
     let http = http()?;
     let session = Arc::new(SqliteSession::open(cfg.session_file.as_str()).await?);
-    let SenderPool { runner, updates, handle } = SenderPool::new(Arc::clone(&session), cfg.api_id);
+    let SenderPool { runner, updates, handle } =
+        SenderPool::new(Arc::clone(&session), cfg.api_id);
     let client = Client::new(handle.clone());
     tokio::spawn(runner.run());
 
@@ -648,7 +872,15 @@ async fn main() -> Res<()> {
     }
     info!("mirrorav up — admin {}", cfg.admin_id);
 
-    let app = App { client, cfg, http, busy: Arc::new(Mutex::new(())) };
+    let app = App {
+        client,
+        cfg,
+        http,
+        busy: Arc::new(Mutex::new(())),
+        pending: Arc::new(Mutex::new(HashMap::new())),
+        job_counter: Arc::new(AtomicU32::new(0)),
+    };
+
     let mut stream = app
         .client
         .stream_updates(updates, UpdatesConfiguration { catch_up: true })
@@ -664,5 +896,4 @@ async fn main() -> Res<()> {
         };
         on_update(&app, update).await;
     }
-    Ok(())
 }
