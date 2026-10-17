@@ -108,9 +108,9 @@ fn extract_playlists(page: &str) -> Vec<String> {
     let mut urls: Vec<String> =
         plain.find_iter(page).map(|m| m.as_str().to_string()).collect();
 
-    let block = Regex::new(r"eval\(function\(p,a,c,k,e,d\)(.{0,3000}?)\}\)\)").unwrap();
+    let block = Regex::new(r"(?s)eval\(function\(p,a,c,k,e,d\)(.{0,3000}?)\}\)\)").unwrap();
     let args = Regex::new(
-        r"\('((?:\\.|[^'\\])*)',(\d+),\d+,'((?:\\.|[^'\\])*)'\.split\('\|'\)",
+        r"(?s)\('((?:\\.|[^'\\])*)',(\d+),\d+,'((?:\\.|[^'\\])*)'\.split\('\|'\)",
     )
     .unwrap();
     if let Some(bm) = block.captures(page) {
@@ -507,14 +507,26 @@ async fn resolve_and_menu(app: App, msg: Message, url: String) {
                 ^ (app.job_counter.fetch_add(1, Ordering::Relaxed) as u64).wrapping_mul(7919)
         );
 
-        let page = get_page(&app.http, &url).await?;
+        let mut page = get_page(&app.http, &url).await?;
         let title = page_title(&page);
         let category = page_category(&page);
 
         let _ = status.edit("🔗 mencari playlist…").await;
-        let pls = extract_playlists(&page);
+        let mut pls = extract_playlists(&page);
         if pls.is_empty() {
-            return Err("no m3u8 found on page".into());
+            // fallback reader: halaman batik anti-bot lain yang lolos 200
+            warn!("no m3u8 on direct page, trying reader fallback");
+            let r = app
+                .http
+                .get(format!("https://r.jina.ai/{url}"))
+                .header("x-return-format", "html")
+                .send()
+                .await?;
+            page = r.text().await?;
+            pls = extract_playlists(&page);
+        }
+        if pls.is_empty() {
+            return Err(format!("no m3u8 found (page {} bytes)", page.len()).into());
         }
         let master_url = pls
             .iter()
