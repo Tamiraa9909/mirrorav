@@ -588,7 +588,7 @@ async fn resolve_and_menu(app: App, msg: Message, url: String) {
                 if r.status() == 200 {
                     if let Ok(b) = r.bytes().await {
                         if b.len() > 1024 {
-                            let p = PathBuf::from(&app.cfg.work_dir).join(format!("thumb_{job}.bin"));
+                            let p = PathBuf::from(&app.cfg.work_dir).join(format!("thumb_{job}.jpg"));
                             if tokio::fs::write(&p, &b).await.is_ok() {
                                 thumb_tmp = Some(p);
                             }
@@ -630,8 +630,18 @@ async fn resolve_and_menu(app: App, msg: Message, url: String) {
 
         let im = InputMessage::new().text(caption.clone()).reply_markup(markup);
         let sent = if let Some(tp) = &thumb_tmp {
-            match app.client.upload_file(tp.to_str().unwrap_or_default()).await {
-                Ok(up) => msg.respond(im.photo(up)).await,
+            match app
+                .client
+                .upload_file(tp.to_str().unwrap_or_default())
+                .await
+            {
+                Ok(uploaded) => match msg.respond(im.clone().photo(uploaded)).await {
+                    Ok(m) => Ok(m),
+                    Err(e) => {
+                        warn!("photo send failed: {e} — text menu fallback");
+                        msg.respond(im).await
+                    }
+                },
                 Err(_) => msg.respond(im).await,
             }
         } else {
