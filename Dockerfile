@@ -22,7 +22,8 @@ ENV PORT=7860 \
     WORK_DIR=/data/tmp \
     SESSION_PATH=/data/mirrorav.session
 
-VOLUME /data
+RUN mkdir -p /data/tmp
+
 EXPOSE 7860
 
 CMD ["/usr/local/bin/mirrorav"]
