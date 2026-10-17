@@ -9,8 +9,10 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use grammers_client::media::{Attribute, InputMedia};
@@ -20,6 +22,7 @@ use grammers_client::Client;
 use grammers_mtsender::{SenderPool, UpdatesConfiguration};
 use grammers_session::storages::SqliteSession;
 use regex::Regex;
+use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 use wreq::Client as HttpClient;
@@ -215,7 +218,7 @@ fn page_category(page: &str) -> String {
         if seen.insert(t.clone()) {
             tags.push(t);
         }
-        if tags.len() >= 3 {
+        if tags.len() >= 6 {
             break;
         }
     }
@@ -233,6 +236,30 @@ fn og_image(page: &str) -> Option<String> {
     }
     let re2 = Regex::new(r#"content="([^"]+)"[^>]*og:image"#).unwrap();
     re2.captures(page).map(|m| m[1].to_string())
+}
+
+/// Full untruncated title from og:title (falls back to <title> tag).
+fn og_title(page: &str) -> Option<String> {
+    let re = Regex::new(r#"og:title" content="([^"]+)""#).unwrap();
+    if let Some(m) = re.captures(page) {
+        return Some(m[1].to_string());
+    }
+    let re2 = Regex::new(r#"content="([^"]+)"[^>]*og:title"#).unwrap();
+    re2.captures(page).map(|m| m[1].to_string())
+}
+
+fn unescape_html(s: &str) -> String {
+    s.replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+}
+
+fn fmt_dur(secs: f64) -> String {
+    let t = secs.max(0.0) as u64;
+    format!("{}:{:02}", t / 60, t % 60)
 }
 
 // ---------------------------------------------------------------- download
@@ -372,6 +399,29 @@ async fn raw_concat(files: &[PathBuf], out: &Path) -> Res<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------- upload progress
+/// Counts bytes as they flow through, so upload progress is measured, not guessed.
+struct ProgressReader<R> {
+    inner: R,
+    counter: Arc<AtomicU64>,
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for ProgressReader<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let res = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = &res {
+            let n = (buf.filled().len() - before) as u64;
+            self.counter.fetch_add(n, Ordering::Relaxed);
+        }
+        res
+    }
+}
+
 // ---------------------------------------------------------------- state
 #[derive(Clone)]
 struct Variant {
@@ -383,6 +433,7 @@ struct Variant {
 #[derive(Clone)]
 struct Pending {
     title: String,
+    category: String,
     dur_secs: f64,
     variants: Vec<Variant>,
 }
@@ -413,7 +464,7 @@ async fn download_and_prepare(
     variant: &Variant,
     shared: Arc<Mutex<String>>,
 ) -> Res<(PathBuf, PathBuf, u64)> {
-    set_prog(&shared, "🎬 membaca playlist…").await;
+    set_prog(&shared, "🎬 reading playlist…").await;
     let vt = http
         .get(&variant.url)
         .header("referer", REFERER)
@@ -433,7 +484,7 @@ async fn download_and_prepare(
     let total = segs.len();
     set_prog(
         &shared,
-        &format!("🎞 {} segmen • ~{:.0} menit", total, dur_secs as f64 / 60.0),
+        &format!("🎞 {} segments • ~{:.0} min", total, dur_secs as f64 / 60.0),
     )
     .await;
 
@@ -475,7 +526,7 @@ async fn download_and_prepare(
     set_prog(
         &shared,
         &format!(
-            "🧩 got {:.0} MB in {:.0}s — concat…",
+            "🧩 got {:.0} MB in {:.0}s — merging…",
             bytes as f64 / 1e6,
             t0.elapsed().as_secs_f64()
         ),
@@ -489,7 +540,7 @@ async fn download_and_prepare(
 
 // ---------------------------------------------------------------- resolve -> menu
 async fn resolve_and_menu(app: App, msg: Message, url: String) {
-    let status = match msg.respond("🕷️ meresolve…").await {
+    let status = match msg.respond("🕷️ resolving…").await {
         Ok(s) => s,
         Err(e) => {
             error!("respond: {e}");
@@ -508,10 +559,8 @@ async fn resolve_and_menu(app: App, msg: Message, url: String) {
         );
 
         let mut page = get_page(&app.http, &url).await?;
-        let title = page_title(&page);
-        let category = page_category(&page);
 
-        let _ = status.edit("🔗 mencari playlist…").await;
+        let _ = status.edit("🔗 locating playlist…").await;
         let mut pls = extract_playlists(&page);
         if pls.is_empty() {
             // fallback reader: halaman batik anti-bot lain yang lolos 200
@@ -528,13 +577,21 @@ async fn resolve_and_menu(app: App, msg: Message, url: String) {
         if pls.is_empty() {
             return Err(format!("no m3u8 found (page {} bytes)", page.len()).into());
         }
+
+        // metadata from the final page (direct or reader fallback)
+        let title = og_title(&page)
+            .map(|t| unescape_html(&t).trim().to_string())
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| page_title(&page));
+        let category = page_category(&page);
+
         let master_url = pls
             .iter()
             .find(|u| u.contains("playlist.m3u8"))
             .unwrap_or_else(|| pls.first().unwrap())
             .clone();
 
-        let _ = status.edit("🎚 membaca varian…").await;
+        let _ = status.edit("🎚 parsing variants…").await;
         let master = app
             .http
             .get(&master_url)
@@ -603,16 +660,16 @@ async fn resolve_and_menu(app: App, msg: Message, url: String) {
             job.clone(),
             Pending {
                 title: title.clone(),
+                category: category.clone(),
                 dur_secs,
                 variants: variants.clone(),
             },
         );
 
-        // caption + tombol
-        let mins = (dur_secs / 60.0) as u64;
-        let secs = (dur_secs % 60.0) as u64;
+        // caption + buttons
         let caption = format!(
-            "📛 {title}\n⏱ {mins}:{secs:02}\n🏷 {category}\n\npilih kualitas 👇"
+            "📛 {title}\n\n🏷 {category}\n⏱ {}\n\n🔗 {url}\n\npick a quality 👇",
+            fmt_dur(dur_secs)
         );
         let buttons: Vec<Button> = variants
             .iter()
@@ -657,7 +714,7 @@ async fn resolve_and_menu(app: App, msg: Message, url: String) {
                 let _ = status.delete().await;
                 Ok(())
             }
-            Err(e) => Err(format!("gagal kirim menu: {e}").into()),
+            Err(e) => Err(format!("failed to send menu: {e}").into()),
         }
     }
     .await;
@@ -684,7 +741,7 @@ async fn on_callback(app: App, cq: CallbackQuery) {
     let pending = app.pending.lock().await.remove(&job);
     let Some(p) = pending else {
         if let Ok(m) = cq.load_message().await {
-            let _ = m.respond("🕷️ menu expired — kirim /mirror lagi").await;
+            let _ = m.respond("🕷️ menu expired — send /mirror again").await;
         }
         return;
     };
@@ -697,7 +754,7 @@ async fn on_callback(app: App, cq: CallbackQuery) {
     let app2 = app.clone();
     if app.busy.try_lock().is_err() {
         if let Ok(m) = cq.load_message().await {
-            let _ = m.respond("🕷️ ada job berjalan — tunggu selesai").await;
+            let _ = m.respond("🕷️ busy — wait for the current job to finish").await;
         }
         return;
     }
@@ -712,7 +769,7 @@ async fn on_callback(app: App, cq: CallbackQuery) {
             }
         };
         let status = match loaded
-            .respond(format!("⬇️ mengunduh {}p — samakan posisi…", variant.h))
+            .respond(format!("⬇️ downloading {}p — hang tight…", variant.h))
             .await
         {
             Ok(s) => s,
@@ -754,16 +811,89 @@ async fn on_callback(app: App, cq: CallbackQuery) {
         .await
         {
             Ok((out, tmp_dir, dur_secs)) => {
-                let _ = status.edit("⬆️ uploading…").await;
-                match app2
-                    .client
-                    .upload_file(out.to_str().unwrap_or_default())
-                    .await
-                {
+                set_prog(&shared, "\u{2b06}\u{fe0f} preparing upload\u{2026}").await;
+                let total = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+                let up_res = if total > 0 {
+                    match tokio::fs::File::open(&out).await {
+                        Ok(file) => {
+                            let counter = Arc::new(AtomicU64::new(0));
+                            let mut reader =
+                                ProgressReader { inner: file, counter: counter.clone() };
+
+                            // sampler: real percentage + speed + ETA from the counting reader
+                            let counter2 = counter.clone();
+                            let total2 = total;
+                            let shared_up = shared.clone();
+                            let up_stop = Arc::new(AtomicBool::new(false));
+                            let up_stop2 = up_stop.clone();
+                            let sampler = tokio::spawn(async move {
+                                let mut last = 0u64;
+                                let mut t_last = std::time::Instant::now();
+                                loop {
+                                    tokio::time::sleep(Duration::from_secs(5)).await;
+                                    if up_stop2.load(Ordering::Relaxed) {
+                                        break;
+                                    }
+                                    let cur = counter2.load(Ordering::Relaxed);
+                                    let dt = t_last.elapsed().as_secs_f64().max(0.2);
+                                    let speed = (cur - last) as f64 / dt / 1e6;
+                                    last = cur;
+                                    t_last = std::time::Instant::now();
+                                    if cur > 0 && total2 > 0 {
+                                        let pct = cur as f64 / total2 as f64 * 100.0;
+                                        let eta = if speed > 0.01 {
+                                            (total2.saturating_sub(cur) as f64 / 1e6 / speed)
+                                                as u64
+                                        } else {
+                                            0
+                                        };
+                                        set_prog(
+                                            &shared_up,
+                                            &format!(
+                                                "\u{2b06}\u{fe0f} uploading {:.1}/{:.1} MB ({:.0}%) \u{2022} {:.1} MB/s \u{2022} ETA {:02}:{:02}",
+                                                cur as f64 / 1e6,
+                                                total2 as f64 / 1e6,
+                                                pct,
+                                                speed,
+                                                eta / 60,
+                                                eta % 60
+                                            ),
+                                        )
+                                        .await;
+                                    }
+                                }
+                            });
+
+                            let res = app2
+                                .client
+                                .upload_stream(
+                                    &mut reader,
+                                    total as usize,
+                                    "mirrorav.mp4".to_string(),
+                                )
+                                .await;
+                            up_stop.store(true, Ordering::Relaxed);
+                            let _ = sampler.await;
+                            res
+                        }
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    app2
+                        .client
+                        .upload_file(out.to_str().unwrap_or_default())
+                        .await
+                };
+
+                match up_res {
                     Ok(uploaded) => {
+                        let size_mb = (total as f64 / 1e6).round() as u64;
                         let media = InputMedia::new()
                             .mime_type("video/mp4")
-                            .caption(format!("{}\n\nmirrorav 🕷 {}p", p.title, variant.h))
+                            .caption(format!(
+                                "{}\n\n{}\n{} \u{2022} {}p \u{2022} {} MB\n\nvia mirrorav",
+                                p.title, p.category, fmt_dur(dur_secs as f64), variant.h, size_mb
+                            ))
                             .document(uploaded)
                             .attribute(Attribute::Video {
                                 round_message: false,
@@ -774,14 +904,14 @@ async fn on_callback(app: App, cq: CallbackQuery) {
                             });
                         if let Err(e) = loaded.respond_album(vec![media]).await {
                             error!("send: {e}");
-                            let _ = status.edit(format!("❌ kirim gagal: {e}")).await;
+                            let _ = status.edit(format!("\u{274c} send failed: {e}")).await;
                         } else {
                             let _ = status.delete().await;
                         }
                     }
                     Err(e) => {
                         error!("upload: {e}");
-                        let _ = status.edit(format!("❌ upload gagal: {e}")).await;
+                        let _ = status.edit(format!("\u{274c} upload failed: {e}")).await;
                     }
                 }
                 let _ = std::fs::remove_dir_all(&tmp_dir);
@@ -838,7 +968,10 @@ async fn on_update(app: &App, update: Update) {
             if text.starts_with("/start") || text.starts_with("/help") {
                 let _ = message
                     .reply(
-                        "MediaFairy mirrorav 🕷\n\n/mirror <url>\n→ pilih kualitas via tombol",
+                        "mirrorav 🕷
+
+/mirror <url>
+→ pick a quality via the buttons",
                     )
                     .await;
                 return;
@@ -846,7 +979,7 @@ async fn on_update(app: &App, update: Update) {
 
             if let Some(rest) = text.strip_prefix("/mirror") {
                 let Some(url) = rest.trim().split_whitespace().next() else {
-                    let _ = message.reply("pakai: /mirror <url>").await;
+                    let _ = message.reply("usage: /mirror <url>").await;
                     return;
                 };
                 let app2 = app.clone();
