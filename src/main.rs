@@ -508,7 +508,7 @@ struct App {
     busy: Arc<Mutex<()>>,
 }
 
-async fn run_job(app: &App, status: Message, reply_ctx: &Message, url: String, want: String) {
+async fn run_job(app: &App, status: grammers_client::message::Message, reply_ctx: &Message, url: String, want: String) {
     let shared: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
     let stop = Arc::new(AtomicBool::new(false));
     let st = status.clone();
